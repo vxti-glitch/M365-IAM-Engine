@@ -447,17 +447,24 @@ function New-EntraUser {
         Write-AuditLog -Level 'WARNING' -Action 'AssignLicense' -UPN $upn -Message "No resolvable SKU for department '$($Row.Department)'. License not assigned."
     }
 
-    Write-AuditLog -Level 'SUCCESS' -Action 'Provisioning' -UPN $upn -Message "Provisioning complete. TempPassword logged separately — transmit via secure channel."
+    Write-AuditLog -Level 'SUCCESS' -Action 'Provisioning' -UPN $upn -Message "Provisioning complete."
 
-    # Log password to a separate, protected file (never to the main audit log)
-    $pwLogPath = [System.IO.Path]::ChangeExtension($script:LogPath, '.passwords.csv')
-    $pwEntry   = [PSCustomObject]@{
-        Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        UPN       = $upn
-        TempPassword = $TempPassword
-    }
-    $pwEntry | Export-Csv -Path $pwLogPath -Append -NoTypeInformation -Encoding UTF8
-    Write-AuditLog -Level 'WARNING' -Action 'Security' -UPN $upn -Message "Temporary password written to SEPARATE file: $pwLogPath — SECURE AND DELETE AFTER USE."
+    # -----------------------------------------------------------------------
+    # SECURE CREDENTIAL DELIVERY
+    # The temporary password is generated in memory and never written to disk.
+    # It must be transmitted to the user via an approved secure channel (e.g., 
+    # self-destructing message, password manager, or direct verbal exchange).
+    # -----------------------------------------------------------------------
+    Write-Host ""
+    Write-Host "  ========================================================" -ForegroundColor DarkCyan
+    Write-Host "  NEW USER CREDENTIAL GENERATED" -ForegroundColor Cyan
+    Write-Host "  UPN      : $upn" -ForegroundColor White
+    Write-Host "  Password : $TempPassword" -ForegroundColor Yellow
+    Write-Host "  ACTION   : Transmit these details via an approved secure channel." -ForegroundColor Red
+    Write-Host "  ========================================================" -ForegroundColor DarkCyan
+    Write-Host ""
+
+    Write-AuditLog -Level 'INFO' -Action 'Security' -UPN $upn -Message "Temporary password generated in memory and displayed to technician. Transmit via secure channel. Not written to disk."
 
     return $true
 }
