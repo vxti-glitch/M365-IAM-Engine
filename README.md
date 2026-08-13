@@ -36,7 +36,7 @@ A single manual onboarding — creating an account, assigning a license, setting
 
 **Offboarding risk without automation:**
 
-The average time to disable a departed employee's account is 4–7 hours in organizations without automated offboarding, according to industry benchmarks. During that window, the account remains active with valid refresh tokens — a credential exposure that represents a direct insider threat and compliance violation under frameworks including SOC 2, ISO 27001, and NIST 800-53 AC-2.
+The average time to disable a departed employee's account is 4–7 hours in organizations without automated offboarding, according to industry benchmarks. During that window, the account remains active with valid refresh tokens — a credential exposure that represents a direct insider threat and organizational security risk.
 
 **What this engine delivers:**
 
@@ -200,7 +200,7 @@ Both scripts write structured, timestamped log entries to `.\Logs\` on each exec
 [2026-08-08 19:51:04] [SUCCESS] | UPN=jane.smith@contoso.com | Action=AssignLicense | License assigned: SkuId=06ebc4ee-1bb5-47dd-8120-11324bc54e06 (Dept='Finance')
 ```
 
-**Provisioning** additionally writes temporary passwords to a separate `.passwords.csv` file — never to the main audit log. That file must be secured and deleted after credential distribution.
+**Provisioning** outputs generated temporary passwords only to the console for the executing technician. These are generated securely in-memory, never written to disk or audit logs, and must be transmitted via an approved secure channel.
 
 Log levels: `INFO`, `SUCCESS`, `WARNING`, `ERROR`
 
@@ -209,10 +209,10 @@ Log levels: `INFO`, `SUCCESS`, `WARNING`, `ERROR`
 ## Security Notes
 
 - Temporary passwords are generated using `System.Security.Cryptography.RandomNumberGenerator`. `Get-Random` is not used.
+- Temporary passwords are kept in-memory and never written to disk or logs. They must be distributed via an approved secure channel.
 - Client secrets are accepted only as `[SecureString]` and converted to plaintext in-memory only at the point of the API call. They are not stored in variables or written to logs.
 - Certificate-based authentication is the recommended auth method for production deployments — it removes the need to manage or rotate a client secret.
 - The offboarding script calls `Invoke-MgInvalidateUserRefreshToken` (with a fallback to `Revoke-MgUserSignInSession`), which invalidates all issued refresh tokens. Active access tokens remain valid for their remaining TTL (typically up to 1 hour). For immediate hard termination, configure Continuous Access Evaluation (CAE) in Entra ID.
-- The `.passwords.csv` file generated during provisioning should be encrypted at rest, distributed via a secure channel, and deleted after use. It must not be committed to version control.
 
 ---
 
