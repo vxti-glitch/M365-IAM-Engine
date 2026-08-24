@@ -1,5 +1,4 @@
-#Requires -Version 5.1
-#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement
+﻿#Requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -107,6 +106,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:AuthMethod = $PSCmdlet.ParameterSetName
 
 # ---------------------------------------------------------------------------
 # REGION: CONSTANTS
@@ -129,6 +129,12 @@ $script:GraphScopes = @(
     'User.ReadWrite.All',
     'Directory.ReadWrite.All',
     'Organization.Read.All'
+)
+
+$script:RequiredGraphModules = @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Users',
+    'Microsoft.Graph.Identity.DirectoryManagement'
 )
 
 # ---------------------------------------------------------------------------
@@ -226,6 +232,50 @@ function New-ComplexPassword {
     return -join $chars
 }
 
+function Test-MicrosoftGraphModules {
+    [CmdletBinding()]
+    param()
+
+    if ($WhatIfPreference) {
+        return
+    }
+
+    $missing = @(
+        foreach ($moduleName in $script:RequiredGraphModules) {
+            if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+                $moduleName
+            }
+        }
+    )
+
+    if ($missing.Count -gt 0) {
+        $install = 'Install-Module Microsoft.Graph -Scope CurrentUser'
+        throw "Missing Microsoft Graph module(s): $($missing -join ', '). Install with: $install"
+    }
+}
+
+function ConvertTo-MailSafeToken {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    $token = $Value.Trim().ToLowerInvariant()
+    $token = $token -replace '\s+', '.'
+    $token = $token -replace '[^a-z0-9._-]', ''
+    $token = $token.Trim('.-_')
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw "Cannot build UPN/mail nickname from blank or unsupported value '$Value'."
+    }
+    return $token
+}
+
+function Escape-ODataString {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '' }
+    return ($Value -replace "'", "''")
+}
+
 # ---------------------------------------------------------------------------
 # REGION: GRAPH HELPERS
 # ---------------------------------------------------------------------------
@@ -237,7 +287,14 @@ function Connect-ToMicrosoftGraph {
     [CmdletBinding()]
     param()
 
-    Write-AuditLog -Level 'INFO' -Action 'GraphConnect' -Message "Initiating Microsoft Graph connection (TenantId=$TenantId, ClientId=$ClientId, AuthMethod=$($PSCmdlet.ParameterSetName))"
+    Write-AuditLog -Level 'INFO' -Action 'GraphConnect' -Message "Initiating Microsoft Graph connection (TenantId=$TenantId, ClientId=$ClientId, AuthMethod=$script:AuthMethod)"
+
+    if ($WhatIfPreference) {
+        Write-AuditLog -Level 'WARNING' -Action 'GraphConnect' -Message 'WhatIf mode - skipping actual Graph connection.'
+        return
+    }
+
+    Test-MicrosoftGraphModules
 
     $connectParams = @{
         TenantId = $TenantId
@@ -245,7 +302,7 @@ function Connect-ToMicrosoftGraph {
         NoWelcome = $true
     }
 
-    if ($PSCmdlet.ParameterSetName -eq 'Certificate') {
+    if ($script:AuthMethod -eq 'Certificate') {
         $connectParams['CertificateThumbprint'] = $CertificateThumbprint
     }
     else {
@@ -256,11 +313,6 @@ function Connect-ToMicrosoftGraph {
             [System.Management.Automation.PSCredential]::new($ClientId,
                 (ConvertTo-SecureString $_ -AsPlainText -Force))
         }
-    }
-
-    if ($PSBoundParameters.ContainsKey('WhatIf')) {
-        Write-AuditLog -Level 'WARNING' -Action 'GraphConnect' -Message 'WhatIf mode — skipping actual Graph connection.'
-        return
     }
 
     try {
@@ -284,8 +336,8 @@ function Resolve-LicenseSkuIds {
 
     Write-AuditLog -Level 'INFO' -Action 'ResolveSKUs' -Message 'Fetching subscribed SKUs from tenant...'
 
-    if ($PSBoundParameters.ContainsKey('WhatIf')) {
-        Write-AuditLog -Level 'WARNING' -Action 'ResolveSKUs' -Message 'WhatIf mode — SKU resolution skipped.'
+    if ($WhatIfPreference) {
+        Write-AuditLog -Level 'WARNING' -Action 'ResolveSKUs' -Message 'WhatIf mode - SKU resolution skipped.'
         return
     }
 
@@ -344,9 +396,11 @@ function New-EntraUser {
         [Parameter(Mandatory)] [string]$TempPassword
     )
 
-    $upn         = "$($Row.FirstName.ToLower()).$($Row.LastName.ToLower())@$UPNDomain"
+    $firstToken  = ConvertTo-MailSafeToken -Value $Row.FirstName
+    $lastToken   = ConvertTo-MailSafeToken -Value $Row.LastName
+    $upn         = "$firstToken.$lastToken@$UPNDomain"
     $displayName = "$($Row.FirstName) $($Row.LastName)"
-    $mailNick    = "$($Row.FirstName.ToLower())$($Row.LastName.ToLower())"
+    $mailNick    = "$firstToken$lastToken" -replace '[^a-z0-9]', ''
 
     Write-AuditLog -Level 'INFO' -Action 'CreateUser' -UPN $upn -Message "Preparing to create user: DisplayName='$displayName', Department='$($Row.Department)', Title='$($Row.Title)'"
 
@@ -358,7 +412,8 @@ function New-EntraUser {
 
     # --- Check for pre-existing user ---
     try {
-        $existingUser = Get-MgUser -Filter "userPrincipalName eq '$upn'" -ErrorAction Stop
+        $upnFilter = Escape-ODataString -Value $upn
+        $existingUser = Get-MgUser -Filter "userPrincipalName eq '$upnFilter'" -ErrorAction Stop
         if ($existingUser) {
             Write-AuditLog -Level 'WARNING' -Action 'CreateUser' -UPN $upn -Message "User already exists (ObjectId=$($existingUser.Id)). Skipping creation."
             return $false
@@ -393,13 +448,15 @@ function New-EntraUser {
 
     # Optionally set manager (best-effort; non-fatal if manager UPN not found)
     $managerRef = $null
-    if ($Row.Manager -and $Row.Manager -ne '') {
+    $managerUpn = if ($Row.PSObject.Properties.Name -contains 'Manager') { ([string]$Row.Manager).Trim() } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($managerUpn)) {
         try {
-            $mgr = Get-MgUser -Filter "userPrincipalName eq '$($Row.Manager)'" -ErrorAction Stop
+            $managerFilter = Escape-ODataString -Value $managerUpn
+            $mgr = Get-MgUser -Filter "userPrincipalName eq '$managerFilter'" -ErrorAction Stop
             if ($mgr) { $managerRef = $mgr.Id }
         }
         catch {
-            Write-AuditLog -Level 'WARNING' -Action 'SetManager' -UPN $upn -Message "Manager '$($Row.Manager)' not found — skipping manager assignment."
+            Write-AuditLog -Level 'WARNING' -Action 'SetManager' -UPN $upn -Message "Manager '$managerUpn' not found - skipping manager assignment."
         }
     }
 
@@ -544,7 +601,7 @@ function Invoke-Provisioning {
     Write-AuditLog -Level 'INFO' -Action 'Summary' -Message "=== Provisioning run complete ==="
     Write-AuditLog -Level 'INFO' -Action 'Summary' -Message "Total: $($stats.Total) | Success: $($stats.Success) | Skipped: $($stats.Skipped) | Failed: $($stats.Failed)"
 
-    if (-not $PSBoundParameters.ContainsKey('WhatIf')) {
+    if (-not $WhatIfPreference) {
         try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
         Write-AuditLog -Level 'INFO' -Action 'Cleanup' -Message 'Disconnected from Microsoft Graph.'
     }

@@ -1,5 +1,4 @@
-#Requires -Version 5.1
-#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Identity.SignIns
+﻿#Requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -98,6 +97,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:AuthMethod = $PSCmdlet.ParameterSetName
+$script:RequiredGraphModules = @(
+    'Microsoft.Graph.Authentication',
+    'Microsoft.Graph.Users',
+    'Microsoft.Graph.Identity.SignIns'
+)
 
 # ---------------------------------------------------------------------------
 # REGION: LOGGING
@@ -140,6 +145,28 @@ function Write-AuditLog {
     }
 }
 
+function Test-MicrosoftGraphModules {
+    [CmdletBinding()]
+    param()
+
+    if ($WhatIfPreference) {
+        return
+    }
+
+    $missing = @(
+        foreach ($moduleName in $script:RequiredGraphModules) {
+            if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+                $moduleName
+            }
+        }
+    )
+
+    if ($missing.Count -gt 0) {
+        $install = 'Install-Module Microsoft.Graph -Scope CurrentUser'
+        throw "Missing Microsoft Graph module(s): $($missing -join ', '). Install with: $install"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # REGION: GRAPH CONNECTION
 # ---------------------------------------------------------------------------
@@ -151,12 +178,14 @@ function Connect-ToMicrosoftGraph {
     [CmdletBinding()]
     param()
 
-    Write-AuditLog -Level 'INFO' -Action 'GraphConnect' -Message "Initiating Microsoft Graph connection (TenantId=$TenantId, ClientId=$ClientId, AuthMethod=$($PSCmdlet.ParameterSetName))"
+    Write-AuditLog -Level 'INFO' -Action 'GraphConnect' -Message "Initiating Microsoft Graph connection (TenantId=$TenantId, ClientId=$ClientId, AuthMethod=$script:AuthMethod)"
 
     if ($WhatIfPreference) {
-        Write-AuditLog -Level 'WARNING' -Action 'GraphConnect' -Message 'WhatIf mode — skipping actual Graph connection.'
+        Write-AuditLog -Level 'WARNING' -Action 'GraphConnect' -Message 'WhatIf mode - skipping actual Graph connection.'
         return
     }
+
+    Test-MicrosoftGraphModules
 
     $connectParams = @{
         TenantId  = $TenantId
@@ -164,7 +193,7 @@ function Connect-ToMicrosoftGraph {
         NoWelcome = $true
     }
 
-    if ($PSCmdlet.ParameterSetName -eq 'Certificate') {
+    if ($script:AuthMethod -eq 'Certificate') {
         $connectParams['CertificateThumbprint'] = $CertificateThumbprint
     }
     else {
@@ -195,7 +224,7 @@ function Resolve-TargetUser {
     .SYNOPSIS Retrieves the Entra ID user object. Throws if not found.
     #>
     [CmdletBinding()]
-    [OutputType([Microsoft.Graph.PowerShell.Models.MicrosoftGraphUser])]
+    [OutputType([object])]
     param()
 
     Write-AuditLog -Level 'INFO' -Action 'ResolveUser' -UPN $UserPrincipalName -Message 'Looking up user in Entra ID...'
@@ -318,7 +347,7 @@ function Remove-AllLicenses {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] [string]$UserId,
-        [Parameter(Mandatory)] [object[]]$AssignedLicenses
+        [Parameter()] [AllowEmptyCollection()] [object[]]$AssignedLicenses = @()
     )
 
     $skuIds = @($AssignedLicenses | Where-Object { $_.SkuId } | Select-Object -ExpandProperty SkuId)
