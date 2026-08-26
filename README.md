@@ -1,12 +1,15 @@
-# M365 Zero-Touch Provisioning and Offboarding Engine
+# M365 Identity Lifecycle Automation Lab
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?style=flat-square&logo=powershell&logoColor=white)
 ![Microsoft Graph](https://img.shields.io/badge/Microsoft%20Graph-API%20v1.0-0078D4?style=flat-square&logo=microsoft&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Microsoft%20365%20%7C%20Entra%20ID-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)
 ![Auth](https://img.shields.io/badge/Auth-Certificate%20%7C%20Client%20Secret-green?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
+[![PowerShell validation](https://github.com/vxti-glitch/M365-IAM-Engine/actions/workflows/powershell-validate.yml/badge.svg)](https://github.com/vxti-glitch/M365-IAM-Engine/actions/workflows/powershell-validate.yml)
 
-A production-grade Identity and Access Management (IAM) automation suite for Microsoft 365 and Entra ID. Two PowerShell scripts, backed by the Microsoft Graph API, automate the full user lifecycle from provisioning through offboarding — eliminating manual IT intervention and reducing the attack surface created by orphaned accounts and stale sessions.
+A portfolio lab that models Microsoft 365 and Entra ID identity-lifecycle automation. Two PowerShell scripts cover CSV-driven provisioning and guarded offboarding with Microsoft Graph authentication, structured audit logging, input validation, and `-WhatIf` execution.
+
+> **Portfolio boundary:** The included users, tenant values, credentials, logs, and outcomes are fictional. Automated tests exercise the offline `-WhatIf` paths; this repository does not claim production use, tenant administration, or live Graph validation.
 
 ---
 
@@ -28,25 +31,9 @@ A production-grade Identity and Access Management (IAM) automation suite for Mic
 
 ## Business Value
 
-Manual user provisioning and offboarding are among the highest-volume, lowest-value tasks in an IT department. They are also among the most consequential when delayed or executed incorrectly.
+Identity-lifecycle work is repetitive but security-sensitive. This lab demonstrates how a technician can turn a documented workflow into guarded automation while preserving review points, least-privilege guidance, dry-run behavior, and an auditable record.
 
-**Provisioning cost without automation:**
-
-A single manual onboarding — creating an account, assigning a license, setting a password, notifying the user — takes an average of 15–30 minutes of IT labor per user. At 100 hires per year in a mid-size organization, that is 25–50 hours of technician time spent on a repeatable, deterministic task.
-
-**Offboarding risk without automation:**
-
-The average time to disable a departed employee's account is 4–7 hours in organizations without automated offboarding, according to industry benchmarks. During that window, the account remains active with valid refresh tokens — a credential exposure that represents a direct insider threat and organizational security risk.
-
-**What this engine delivers:**
-
-| Metric | Manual Process | Automated (This Engine) |
-|---|---|---|
-| Provisioning time per user | 15–30 minutes | Under 60 seconds |
-| Offboarding time to disable + revoke | 4–7 hours | Under 30 seconds |
-| License assignment accuracy | Dependent on technician | Policy-enforced, deterministic |
-| Audit trail | Manual ticket notes | Structured, timestamped log file |
-| Password compliance | Inconsistent | Cryptographically generated, policy-enforced |
+The project intentionally avoids unsupported time-savings or production-success metrics. Its evidence is the source code, simulated input, `-WhatIf` logs, and automated tests checked into this repository.
 
 ---
 

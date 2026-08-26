@@ -6,8 +6,8 @@
     creates Entra ID (Azure AD) users, assigns licenses, and emits an audit log.
 
 .DESCRIPTION
-    Invoke-M365Provisioning.ps1 is a production-grade provisioning script designed
-    for Microsoft 365 / Entra ID environments. It performs the following actions
+    Invoke-M365Provisioning.ps1 is a portfolio automation script that models
+    Microsoft 365 / Entra ID provisioning. It performs the following actions
     for each row in the onboarding_queue.csv:
 
         1. Connects to Microsoft Graph via certificate-based or client-secret auth.
@@ -171,9 +171,11 @@ function Write-AuditLog {
     try {
         $logDir = Split-Path $script:LogPath -Parent
         if ($logDir -and -not (Test-Path $logDir)) {
-            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            # WhatIf protects tenant operations, but the local audit evidence
+            # should still be written so the simulation can be reviewed.
+            New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
         }
-        Add-Content -Path $script:LogPath -Value $logLine -Encoding UTF8
+        Add-Content -Path $script:LogPath -Value $logLine -Encoding UTF8 -WhatIf:$false
     }
     catch {
         Write-Warning "Audit log write failed: $_"

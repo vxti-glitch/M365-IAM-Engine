@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  parse:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,3 +22,9 @@ jobs:
               throw "PowerShell parse failed for $($file.FullName): $($messages -join '; ')"
             }
           }
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser
+      - name: Run Pester WhatIf tests
+        shell: pwsh
+        run: Invoke-Pester -Path ./tests -CI -Output Detailed
