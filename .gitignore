@@ -1,3 +1,5 @@
 Logs/*.log
+.tools/
+testResults.xml
 *.tmp
 *.bak

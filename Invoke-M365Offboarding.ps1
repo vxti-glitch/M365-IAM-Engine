@@ -6,8 +6,8 @@
     revokes all active sign-in sessions, and strips all Office 365 licenses.
 
 .DESCRIPTION
-    Invoke-M365Offboarding.ps1 is a production-grade offboarding script for
-    Microsoft 365 / Entra ID environments. It performs the following actions
+    Invoke-M365Offboarding.ps1 is a portfolio automation script that models
+    Microsoft 365 / Entra ID offboarding. It performs the following actions
     against a specified UserPrincipalName in a single, atomic sequence:
 
         1.  Connects to Microsoft Graph via certificate-based or client-secret auth.
@@ -136,9 +136,11 @@ function Write-AuditLog {
     try {
         $logDir = Split-Path $LogPath -Parent
         if ($logDir -and -not (Test-Path $logDir)) {
-            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            # WhatIf protects tenant operations, but the local audit evidence
+            # should still be written so the simulation can be reviewed.
+            New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
         }
-        Add-Content -Path $LogPath -Value $logLine -Encoding UTF8
+        Add-Content -Path $LogPath -Value $logLine -Encoding UTF8 -WhatIf:$false
     }
     catch {
         Write-Warning "Audit log write failed: $_"
