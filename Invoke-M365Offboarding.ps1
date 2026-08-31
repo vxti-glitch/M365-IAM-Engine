@@ -1,422 +1,226 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 
 <#
 .SYNOPSIS
-    Zero-Touch M365 User Offboarding Engine — Disables an Entra ID account,
-    revokes all active sign-in sessions, and strips all Office 365 licenses.
+    Plans or runs an ordered Microsoft 365 offboarding workflow.
 
 .DESCRIPTION
-    Invoke-M365Offboarding.ps1 is a portfolio automation script that models
-    Microsoft 365 / Entra ID offboarding. It performs the following actions
-    against a specified UserPrincipalName in a single, atomic sequence:
+    The default is non-destructive. Each policy-dependent action is recorded as
+    Planned until its explicit approval switch and prerequisites are supplied.
+    The result lists Planned, SkippedWhatIf, Completed, Failed, or Unknown for
+    every action. There is no rollback and partial completion is reported.
 
-        1.  Connects to Microsoft Graph via certificate-based or client-secret auth.
-        2.  Resolves the user object — aborts cleanly if the user does not exist.
-        3.  Disables the account (AccountEnabled = $false) — immediate effect.
-        4.  Revokes all active Azure AD sign-in sessions (Revoke-MgUserSignInSession).
-             This invalidates all refresh tokens and terminates active SSO sessions.
-        5.  Reads all currently assigned license SKUs.
-        6.  Strips every license from the account in a single Graph API call.
-        7.  Emits a timestamped, structured audit log for every action.
+.PARAMETER ApproveDisableSignIn
+    Explicit approval to set AccountEnabled to false.
 
-    The script is idempotent: re-running against an already-disabled, license-free
-    account is safe and will log the no-op steps.
+.PARAMETER ApproveSessionRevocation
+    Explicit approval to request sign-in session revocation.
 
-.PARAMETER UserPrincipalName
-    The full UPN of the user to offboard (e.g., jane.smith@contoso.com). Required.
+.PARAMETER ApproveLicenseRemoval
+    Explicit approval to remove assigned licenses. Also requires
+    -LicensePrerequisitesConfirmed.
 
-.PARAMETER TenantId
-    The Azure AD Tenant ID (GUID). Required.
-
-.PARAMETER ClientId
-    The App Registration Client ID (GUID) for Graph API authentication. Required.
-
-.PARAMETER ClientSecret
-    [SecureString] The client secret for the App Registration. Mutually exclusive
-    with -CertificateThumbprint. Prefer certificate auth in production.
-
-.PARAMETER CertificateThumbprint
-    Thumbprint of a certificate installed in the local machine or current user
-    certificate store. Preferred for production deployments.
-
-.PARAMETER LogPath
-    Path to the audit log file. Defaults to .\Logs\M365Offboarding_<timestamp>.log.
-
-.PARAMETER WhatIf
-    Simulates every step without making any changes to the tenant.
-
-.EXAMPLE
-    .\Invoke-M365Offboarding.ps1 `
-        -UserPrincipalName "jane.smith@contoso.com" `
-        -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientId  "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-        -CertificateThumbprint "AABBCCDDEEFF..."
-
-.EXAMPLE
-    .\Invoke-M365Offboarding.ps1 `
-        -UserPrincipalName "tom.chen@contoso.com" `
-        -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientId  "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-        -ClientSecret (Read-Host -AsSecureString "Enter Client Secret") `
-        -WhatIf
+.PARAMETER LicensePrerequisitesConfirmed
+    Confirms that retention, mailbox/data ownership, legal hold, and other
+    organization-specific prerequisites were reviewed before license removal.
 
 .NOTES
-    Author      : Zero-Touch IAM Engine
-    Version     : 1.0.0
-    Requires    : Microsoft.Graph (Install-Module Microsoft.Graph -Scope CurrentUser)
-    Permissions : User.ReadWrite.All, Directory.ReadWrite.All (Application permissions)
-    Impact      : Immediate — session revocation takes effect within seconds.
-                  The user's access to all M365 services is terminated on completion.
+    Offline WhatIf tests do not validate live Microsoft Graph behavior.
 #>
 
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ClientSecret')]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateNotNullOrEmpty()]
-    [string]$UserPrincipalName,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$TenantId,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$ClientId,
-
-    [Parameter(Mandatory = $true, ParameterSetName = 'ClientSecret')]
-    [ValidateNotNull()]
-    [SecureString]$ClientSecret,
-
-    [Parameter(Mandatory = $true, ParameterSetName = 'Certificate')]
-    [ValidateNotNullOrEmpty()]
-    [string]$CertificateThumbprint,
-
-    [Parameter(Mandatory = $false)]
-    [string]$LogPath = ".\Logs\M365Offboarding_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    [Parameter(Mandatory, Position = 0)][ValidateNotNullOrEmpty()][string]$UserPrincipalName,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TenantId,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ClientId,
+    [Parameter(Mandatory, ParameterSetName = 'ClientSecret')][ValidateNotNull()][SecureString]$ClientSecret,
+    [Parameter(Mandatory, ParameterSetName = 'Certificate')][ValidateNotNullOrEmpty()][string]$CertificateThumbprint,
+    [string]$LogPath = ".\Logs\M365Offboarding_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+    [switch]$ApproveDisableSignIn,
+    [switch]$ApproveSessionRevocation,
+    [switch]$ApproveLicenseRemoval,
+    [switch]$LicensePrerequisitesConfirmed
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AuthMethod = $PSCmdlet.ParameterSetName
-$script:RequiredGraphModules = @(
-    'Microsoft.Graph.Authentication',
-    'Microsoft.Graph.Users',
-    'Microsoft.Graph.Identity.SignIns'
-)
+$authMethod = $PSCmdlet.ParameterSetName
+$results = [System.Collections.Generic.List[object]]::new()
 
-# ---------------------------------------------------------------------------
-# REGION: LOGGING
-# ---------------------------------------------------------------------------
-
-function Write-AuditLog {
-    <#
-    .SYNOPSIS Writes a structured, timestamped entry to the audit log and console.
-    #>
-    [CmdletBinding()]
+function Write-WorkflowLog {
     param(
-        [Parameter(Mandatory)] [string]$Message,
-        [Parameter(Mandatory)] [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')] [string]$Level,
-        [Parameter()] [string]$UPN    = '',
-        [Parameter()] [string]$Action = ''
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'WARNING', 'ERROR')][string]$Level = 'INFO',
+        [string]$Action = ''
     )
-
-    $timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $upnPart    = if ($UPN)    { " | UPN=$UPN" }       else { '' }
-    $actionPart = if ($Action) { " | Action=$Action" } else { '' }
-    $logLine    = "[$timestamp] [$Level]$upnPart$actionPart | $Message"
-
-    $colour = switch ($Level) {
-        'SUCCESS' { 'Green'  }
-        'WARNING' { 'Yellow' }
-        'ERROR'   { 'Red'    }
-        default   { 'Cyan'   }
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] | UPN=$UserPrincipalName | Action=$Action | $Message"
+    Write-Host $line
+    $directory = Split-Path $LogPath -Parent
+    if ($directory -and -not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force -WhatIf:$false | Out-Null
     }
-    Write-Host $logLine -ForegroundColor $colour
-
-    try {
-        $logDir = Split-Path $LogPath -Parent
-        if ($logDir -and -not (Test-Path $logDir)) {
-            # WhatIf protects tenant operations, but the local audit evidence
-            # should still be written so the simulation can be reviewed.
-            New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
-        }
-        Add-Content -Path $LogPath -Value $logLine -Encoding UTF8 -WhatIf:$false
-    }
-    catch {
-        Write-Warning "Audit log write failed: $_"
-    }
+    Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8 -WhatIf:$false
 }
 
-function Test-MicrosoftGraphModules {
-    [CmdletBinding()]
-    param()
-
-    if ($WhatIfPreference) {
-        return
-    }
-
-    $missing = @(
-        foreach ($moduleName in $script:RequiredGraphModules) {
-            if (-not (Get-Module -ListAvailable -Name $moduleName)) {
-                $moduleName
-            }
-        }
+function Add-ActionResult {
+    param(
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][ValidateSet('Planned', 'SkippedWhatIf', 'Completed', 'Failed', 'Unknown')][string]$State,
+        [Parameter(Mandatory)][string]$Detail,
+        [bool]$Required = $false
     )
-
-    if ($missing.Count -gt 0) {
-        $install = 'Install-Module Microsoft.Graph -Scope CurrentUser'
-        throw "Missing Microsoft Graph module(s): $($missing -join ', '). Install with: $install"
+    $result = [pscustomobject]@{
+        Action = $Action
+        State = $State
+        Required = $Required
+        Detail = $Detail
     }
+    $results.Add($result)
+    $level = if ($State -in @('Failed', 'Unknown')) { 'ERROR' } elseif ($State -in @('Planned', 'SkippedWhatIf')) { 'WARNING' } else { 'INFO' }
+    Write-WorkflowLog -Action $Action -Level $level -Message "State=$State; $Detail"
+    return $result
 }
 
-# ---------------------------------------------------------------------------
-# REGION: GRAPH CONNECTION
-# ---------------------------------------------------------------------------
-
-function Connect-ToMicrosoftGraph {
-    <#
-    .SYNOPSIS Authenticates to Microsoft Graph using the supplied credential method.
-    #>
-    [CmdletBinding()]
-    param()
-
-    Write-AuditLog -Level 'INFO' -Action 'GraphConnect' -Message "Initiating Microsoft Graph connection (TenantId=$TenantId, ClientId=$ClientId, AuthMethod=$script:AuthMethod)"
-
-    if ($WhatIfPreference) {
-        Write-AuditLog -Level 'WARNING' -Action 'GraphConnect' -Message 'WhatIf mode - skipping actual Graph connection.'
-        return
-    }
-
-    Test-MicrosoftGraphModules
-
-    $connectParams = @{
-        TenantId  = $TenantId
-        ClientId  = $ClientId
-        NoWelcome = $true
-    }
-
-    if ($script:AuthMethod -eq 'Certificate') {
-        $connectParams['CertificateThumbprint'] = $CertificateThumbprint
-    }
-    else {
-        $connectParams['ClientSecretCredential'] = [System.Net.NetworkCredential]::new(
-            '', $ClientSecret
-        ).Password | ForEach-Object {
-            [System.Management.Automation.PSCredential]::new($ClientId,
-                (ConvertTo-SecureString $_ -AsPlainText -Force))
-        }
-    }
-
-    try {
-        Connect-MgGraph @connectParams -ErrorAction Stop
-        Write-AuditLog -Level 'SUCCESS' -Action 'GraphConnect' -Message 'Connected to Microsoft Graph successfully.'
-    }
-    catch {
-        Write-AuditLog -Level 'ERROR' -Action 'GraphConnect' -Message "Graph connection failed: $_"
-        throw
-    }
+function Test-GraphNotFound {
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+    return $ErrorRecord.Exception.Message -match '404|Request_ResourceNotFound|does not exist'
 }
 
-# ---------------------------------------------------------------------------
-# REGION: OFFBOARDING STEPS
-# ---------------------------------------------------------------------------
-
-function Resolve-TargetUser {
-    <#
-    .SYNOPSIS Retrieves the Entra ID user object. Throws if not found.
-    #>
-    [CmdletBinding()]
-    [OutputType([object])]
-    param()
-
-    Write-AuditLog -Level 'INFO' -Action 'ResolveUser' -UPN $UserPrincipalName -Message 'Looking up user in Entra ID...'
-
+function Connect-WorkflowGraph {
+    param([Parameter(Mandatory)][ValidateSet('ClientSecret', 'Certificate')][string]$AuthMethod)
     if ($WhatIfPreference) {
-        Write-AuditLog -Level 'WARNING' -Action 'ResolveUser' -UPN $UserPrincipalName -Message 'WhatIf: Skipping live lookup. Returning synthetic object.'
-        # Return a mock object for downstream WhatIf steps
-        return [PSCustomObject]@{
-            Id                = '00000000-0000-0000-0000-000000000000'
-            UserPrincipalName = $UserPrincipalName
-            DisplayName       = 'WhatIf User'
-            AccountEnabled    = $true
-            AssignedLicenses  = @()
-        }
+        Add-ActionResult -Action 'GraphConnect' -State 'SkippedWhatIf' -Detail "No connection attempted; AuthMethod=$AuthMethod" | Out-Null
+        return $true
     }
-
     try {
-        $user = Get-MgUser -UserId $UserPrincipalName `
-            -Property 'Id,UserPrincipalName,DisplayName,AccountEnabled,AssignedLicenses' `
-            -ErrorAction Stop
-    }
-    catch {
-        if ($_.Exception.Message -match '404|Request_ResourceNotFound|does not exist') {
-            Write-AuditLog -Level 'ERROR' -Action 'ResolveUser' -UPN $UserPrincipalName -Message 'User not found in Entra ID. Offboarding aborted.'
+        $connect = @{ TenantId = $TenantId; ClientId = $ClientId; NoWelcome = $true }
+        if ($AuthMethod -eq 'Certificate') {
+            $connect.CertificateThumbprint = $CertificateThumbprint
         }
         else {
-            Write-AuditLog -Level 'ERROR' -Action 'ResolveUser' -UPN $UserPrincipalName -Message "Unexpected error during user lookup: $_"
+            $connect.ClientSecretCredential = [pscredential]::new($ClientId, $ClientSecret)
         }
-        throw
-    }
-
-    Write-AuditLog -Level 'SUCCESS' -Action 'ResolveUser' -UPN $UserPrincipalName -Message "User resolved. ObjectId=$($user.Id) | DisplayName='$($user.DisplayName)' | AccountEnabled=$($user.AccountEnabled)"
-    return $user
-}
-
-function Disable-EntraAccount {
-    <#
-    .SYNOPSIS Sets AccountEnabled = $false on the target user. Idempotent.
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param(
-        [Parameter(Mandatory)] [string]$UserId,
-        [Parameter(Mandatory)] [bool]$CurrentState
-    )
-
-    if (-not $CurrentState) {
-        Write-AuditLog -Level 'INFO' -Action 'DisableAccount' -UPN $UserPrincipalName -Message 'Account is already disabled — no change required.'
-        return
-    }
-
-    if (-not $PSCmdlet.ShouldProcess($UserPrincipalName, 'Disable Entra ID Account (AccountEnabled = $false)')) {
-        Write-AuditLog -Level 'WARNING' -Action 'DisableAccount' -UPN $UserPrincipalName -Message 'WhatIf: Account disable skipped.'
-        return
-    }
-
-    try {
-        Update-MgUser -UserId $UserId -AccountEnabled $false -ErrorAction Stop
-        Write-AuditLog -Level 'SUCCESS' -Action 'DisableAccount' -UPN $UserPrincipalName -Message 'Account disabled successfully (AccountEnabled = $false).'
+        Connect-MgGraph @connect -ErrorAction Stop
+        Add-ActionResult -Action 'GraphConnect' -State 'Completed' -Detail "Connected using AuthMethod=$AuthMethod" | Out-Null
+        return $true
     }
     catch {
-        Write-AuditLog -Level 'ERROR' -Action 'DisableAccount' -UPN $UserPrincipalName -Message "Failed to disable account: $_"
-        throw
+        Add-ActionResult -Action 'GraphConnect' -State 'Unknown' -Required $true -Detail "Connection failed: $($_.Exception.Message)" | Out-Null
+        return $false
     }
 }
 
-function Invoke-SessionRevocation {
-    <#
-    .SYNOPSIS
-        Calls Revoke-MgUserSignInSession, which invalidates all refresh tokens
-        and forces re-authentication for every active session and app.
-        Effect is near-immediate (typically < 60 seconds for Azure services).
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param(
-        [Parameter(Mandatory)] [string]$UserId
-    )
-
-    if (-not $PSCmdlet.ShouldProcess($UserPrincipalName, 'Revoke all active Azure AD sign-in sessions')) {
-        Write-AuditLog -Level 'WARNING' -Action 'RevokeSession' -UPN $UserPrincipalName -Message 'WhatIf: Session revocation skipped.'
-        return
+function Resolve-WorkflowUser {
+    if ($WhatIfPreference) {
+        Add-ActionResult -Action 'ResolveUser' -State 'SkippedWhatIf' -Detail 'No live lookup attempted; downstream actions remain previews.' | Out-Null
+        return [pscustomobject]@{ Id = 'whatif-user'; AccountEnabled = $true; AssignedLicenses = @([pscustomobject]@{ SkuId = 'whatif-sku' }) }
     }
-
     try {
-        $result = Invoke-MgInvalidateUserRefreshToken -UserId $UserId -ErrorAction Stop
-
-        if ($result) {
-            Write-AuditLog -Level 'SUCCESS' -Action 'RevokeSession' -UPN $UserPrincipalName -Message 'All refresh tokens invalidated. Active SSO sessions terminated.'
+        $user = Get-MgUser -UserId $UserPrincipalName -Property 'Id,AccountEnabled,AssignedLicenses' -ErrorAction Stop
+        if ($null -eq $user -or @($user).Count -ne 1) {
+            Add-ActionResult -Action 'ResolveUser' -State 'Unknown' -Required $true -Detail 'Lookup returned zero or multiple records.' | Out-Null
+            return $null
+        }
+        Add-ActionResult -Action 'ResolveUser' -State 'Completed' -Detail "Resolved ObjectId=$($user.Id)" | Out-Null
+        return $user
+    }
+    catch {
+        if (Test-GraphNotFound -ErrorRecord $_) {
+            Add-ActionResult -Action 'ResolveUser' -State 'Failed' -Required $true -Detail 'User was not found; no writes attempted.' | Out-Null
         }
         else {
-            # Graph returns a boolean; a $false result is unusual but non-fatal
-            Write-AuditLog -Level 'WARNING' -Action 'RevokeSession' -UPN $UserPrincipalName -Message 'Revocation call returned false — tenant may require delay. Verify via Entra ID Sign-In Logs.'
+            Add-ActionResult -Action 'ResolveUser' -State 'Unknown' -Required $true -Detail "Lookup failed; no writes attempted: $($_.Exception.Message)" | Out-Null
         }
-    }
-    catch {
-        # If the newer cmdlet isn't available, fall back to the v1 endpoint
-        if ($_.Exception.Message -match 'not found|not recognized') {
-            Write-AuditLog -Level 'WARNING' -Action 'RevokeSession' -UPN $UserPrincipalName -Message "Invoke-MgInvalidateUserRefreshToken not available — trying Revoke-MgUserSignInSession fallback."
-            try {
-                Revoke-MgUserSignInSession -UserId $UserId -ErrorAction Stop | Out-Null
-                Write-AuditLog -Level 'SUCCESS' -Action 'RevokeSession' -UPN $UserPrincipalName -Message 'Sign-in sessions revoked via fallback cmdlet.'
-            }
-            catch {
-                Write-AuditLog -Level 'ERROR' -Action 'RevokeSession' -UPN $UserPrincipalName -Message "Fallback session revocation failed: $_"
-                throw
-            }
-        }
-        else {
-            Write-AuditLog -Level 'ERROR' -Action 'RevokeSession' -UPN $UserPrincipalName -Message "Session revocation failed: $_"
-            throw
-        }
+        return $null
     }
 }
 
-function Remove-AllLicenses {
-    <#
-    .SYNOPSIS
-        Reads all assigned license SKUs and removes them in a single Graph call.
-        If the account has no licenses, logs a no-op and returns cleanly.
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
+function Invoke-ApprovedAction {
     param(
-        [Parameter(Mandatory)] [string]$UserId,
-        [Parameter()] [AllowEmptyCollection()] [object[]]$AssignedLicenses = @()
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][bool]$Approved,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][scriptblock]$Operation,
+        [bool]$Required = $false
     )
-
-    $skuIds = @($AssignedLicenses | Where-Object { $_.SkuId } | Select-Object -ExpandProperty SkuId)
-
-    if ($skuIds.Count -eq 0) {
-        Write-AuditLog -Level 'INFO' -Action 'RemoveLicenses' -UPN $UserPrincipalName -Message 'No licenses assigned — nothing to remove.'
+    if (-not $Approved) {
+        Add-ActionResult -Action $Action -State 'Planned' -Required $Required -Detail "Approval required: $Description" | Out-Null
         return
     }
-
-    $skuList = $skuIds -join ', '
-    Write-AuditLog -Level 'INFO' -Action 'RemoveLicenses' -UPN $UserPrincipalName -Message "Found $($skuIds.Count) assigned license(s): $skuList"
-
-    if (-not $PSCmdlet.ShouldProcess($UserPrincipalName, "Remove $($skuIds.Count) license(s): $skuList")) {
-        Write-AuditLog -Level 'WARNING' -Action 'RemoveLicenses' -UPN $UserPrincipalName -Message 'WhatIf: License removal skipped.'
+    if (-not $PSCmdlet.ShouldProcess($UserPrincipalName, $Description)) {
+        Add-ActionResult -Action $Action -State 'SkippedWhatIf' -Required $Required -Detail "Approved path previewed; no write performed: $Description" | Out-Null
         return
     }
-
     try {
-        Set-MgUserLicense -UserId $UserId `
-            -AddLicenses @() `
-            -RemoveLicenses $skuIds `
-            -ErrorAction Stop | Out-Null
-
-        Write-AuditLog -Level 'SUCCESS' -Action 'RemoveLicenses' -UPN $UserPrincipalName -Message "All $($skuIds.Count) license(s) removed successfully. SKUs: $skuList"
+        & $Operation
+        Add-ActionResult -Action $Action -State 'Completed' -Required $Required -Detail $Description | Out-Null
     }
     catch {
-        Write-AuditLog -Level 'ERROR' -Action 'RemoveLicenses' -UPN $UserPrincipalName -Message "License removal failed: $_"
-        throw
+        Add-ActionResult -Action $Action -State 'Failed' -Required $Required -Detail "$Description failed: $($_.Exception.Message)" | Out-Null
     }
 }
 
-# ---------------------------------------------------------------------------
-# REGION: MAIN EXECUTION
-# ---------------------------------------------------------------------------
+function Invoke-OffboardingWorkflow {
+    Write-WorkflowLog -Action 'Startup' -Message "Ordered best-effort workflow started; AuthMethod=$authMethod; Mode=$(if ($WhatIfPreference) { 'WhatIf' } else { 'Live' })"
+    if (-not (Connect-WorkflowGraph -AuthMethod $authMethod)) { return }
+    $user = Resolve-WorkflowUser
+    if ($null -eq $user) { return }
 
-function Invoke-Offboarding {
-    [CmdletBinding(SupportsShouldProcess)]
-    param()
+    Invoke-ApprovedAction -Action 'DisableSignIn' -Approved $ApproveDisableSignIn.IsPresent `
+        -Description 'Disable sign-in by setting AccountEnabled=false' -Required $true `
+        -Operation { Update-MgUser -UserId $user.Id -AccountEnabled $false -ErrorAction Stop }
 
-    Write-AuditLog -Level 'INFO' -Action 'Startup' -Message "=== Invoke-M365Offboarding.ps1 started. Mode=$(if($WhatIfPreference){'WHATIF'}else{'LIVE'}) ==="
-    Write-AuditLog -Level 'INFO' -Action 'Startup' -Message "Target UPN: $UserPrincipalName"
-    Write-AuditLog -Level 'INFO' -Action 'Startup' -Message "Log file: $LogPath"
+    Invoke-ApprovedAction -Action 'RevokeSessions' -Approved $ApproveSessionRevocation.IsPresent `
+        -Description 'Request sign-in session revocation; verify effect separately' `
+        -Operation { Revoke-MgUserSignInSession -UserId $user.Id -ErrorAction Stop | Out-Null }
 
-    # Step 1: Connect
-    Connect-ToMicrosoftGraph
+    $licenseApproved = $ApproveLicenseRemoval -and $LicensePrerequisitesConfirmed
+    $licenseDescription = if ($ApproveLicenseRemoval -and -not $LicensePrerequisitesConfirmed) {
+        'License approval supplied but retention/ownership/legal-hold prerequisites are not confirmed'
+    } else { 'Remove currently assigned license SKU IDs after prerequisite review' }
+    $licenseIds = @()
+    foreach ($assignedLicense in @($user.AssignedLicenses)) {
+        if ($assignedLicense.SkuId) { $licenseIds += $assignedLicense.SkuId }
+    }
+    Invoke-ApprovedAction -Action 'RemoveLicenses' -Approved $licenseApproved `
+        -Description $licenseDescription `
+        -Operation {
+            if ($licenseIds.Count -gt 0) {
+                Set-MgUserLicense -UserId $user.Id -AddLicenses @() -RemoveLicenses $licenseIds -ErrorAction Stop | Out-Null
+            }
+        }
 
-    # Step 2: Resolve user — fatal if not found
-    $user = Resolve-TargetUser
+    foreach ($pending in @(
+        'MailboxAndRetentionPolicy', 'OwnershipTransfer', 'GroupCleanup',
+        'OneDriveAndLegalHold', 'AccountDeletion'
+    )) {
+        Add-ActionResult -Action $pending -State 'Planned' -Detail 'Policy-dependent action is intentionally not implemented as an automatic default.' | Out-Null
+    }
+}
 
-    # Step 3: Disable account — immediate
-    Disable-EntraAccount -UserId $user.Id -CurrentState $user.AccountEnabled
-
-    # Step 4: Revoke all sign-in sessions — terminates active tokens
-    Invoke-SessionRevocation -UserId $user.Id
-
-    # Step 5: Strip all licenses
-    Remove-AllLicenses -UserId $user.Id -AssignedLicenses $user.AssignedLicenses
-
-    # Summary
-    Write-AuditLog -Level 'SUCCESS' -Action 'Offboarding' -UPN $UserPrincipalName -Message '=== Offboarding sequence complete. Account disabled | Sessions revoked | Licenses stripped. ==='
-    Write-AuditLog -Level 'WARNING' -Action 'PostOffboard' -UPN $UserPrincipalName -Message 'Recommended next steps: Remove from security groups, forward mailbox, revoke MFA methods, archive data per retention policy.'
-
+try {
+    Invoke-OffboardingWorkflow
+}
+finally {
     if (-not $WhatIfPreference) {
-        try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
-        Write-AuditLog -Level 'INFO' -Action 'Cleanup' -Message 'Disconnected from Microsoft Graph.'
+        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
     }
 }
 
-# Entry point
-Invoke-Offboarding
+$failedRequired = @($results | Where-Object { $_.Required -and $_.State -in @('Failed', 'Unknown') })
+$completed = @($results | Where-Object State -eq 'Completed').Count
+$planned = @($results | Where-Object State -in @('Planned', 'SkippedWhatIf')).Count
+$final = [pscustomobject]@{
+    UserPrincipalName = $UserPrincipalName
+    Status = if ($failedRequired.Count -gt 0) { 'Failed' } elseif ($completed -gt 0) { 'PartialOrCompleted' } else { 'PlannedOnly' }
+    Succeeded = ($failedRequired.Count -eq 0)
+    CompletedCount = $completed
+    PlannedCount = $planned
+    Results = @($results)
+    RollbackAvailable = $false
+}
+
+Write-WorkflowLog -Action 'Summary' -Level $(if ($final.Succeeded) { 'INFO' } else { 'ERROR' }) `
+    -Message "FinalStatus=$($final.Status); Completed=$completed; PlannedOrSkipped=$planned; FailedRequired=$($failedRequired.Count); RollbackAvailable=false"
+$final
+if (-not $final.Succeeded) { throw 'Offboarding workflow ended with a failed or unknown required action.' }
