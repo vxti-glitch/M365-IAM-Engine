@@ -1,208 +1,74 @@
 # M365 Identity Lifecycle Automation Lab
 
-![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?style=flat-square&logo=powershell&logoColor=white)
-![Microsoft Graph](https://img.shields.io/badge/Microsoft%20Graph-API%20v1.0-0078D4?style=flat-square&logo=microsoft&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Microsoft%20365%20%7C%20Entra%20ID-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)
-![Auth](https://img.shields.io/badge/Auth-Certificate%20%7C%20Client%20Secret-green?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
-[![PowerShell validation](https://github.com/vxti-glitch/M365-IAM-Engine/actions/workflows/powershell-validate.yml/badge.svg)](https://github.com/vxti-glitch/M365-IAM-Engine/actions/workflows/powershell-validate.yml)
+This portfolio lab models CSV-driven Microsoft Entra provisioning and an ordered Microsoft 365 offboarding workflow. The code emphasizes explicit approvals, `WhatIf`, per-action results, and honest partial-failure reporting.
 
-A portfolio lab that models Microsoft 365 and Entra ID identity-lifecycle automation. Two PowerShell scripts cover CSV-driven provisioning and guarded offboarding with Microsoft Graph authentication, structured audit logging, input validation, and `-WhatIf` execution.
+> Live Microsoft Graph behavior has not been validated. The included identities, tenant values, logs, and test outcomes are fictional. Offline and mocked tests do not prove tenant permissions, licensing, retention, mailbox, OneDrive, session, or production behavior.
 
-> **Portfolio boundary:** The included users, tenant values, credentials, logs, and outcomes are fictional. Automated tests exercise the offline `-WhatIf` paths; this repository does not claim production use, tenant administration, or live Graph validation.
+## Result model
 
----
+Both scripts return structured action results with these states:
 
-## Table of Contents
+- `Planned`: policy or approval work remains.
+- `SkippedWhatIf`: an approved path was previewed and no write occurred.
+- `Completed`: the specific live/mock action returned successfully.
+- `Failed`: the action failed with a known non-success result.
+- `Unknown`: lookup, connection, or other indeterminate behavior requires investigation.
 
-- [Business Value](#business-value)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Configuration](#configuration)
-- [How to Use](#how-to-use)
-  - [Provisioning](#1-provisioning)
-  - [Offboarding](#2-offboarding)
-- [CSV Schema](#csv-schema)
-- [License SKU Mapping](#license-sku-mapping)
-- [Audit Logging](#audit-logging)
-- [Security Notes](#security-notes)
+The workflow has no rollback. If a user is created and a later license action fails, the final status is failed and the completed user creation remains visible in the action list.
 
----
+## Provisioning behavior
 
-## Business Value
+`Invoke-M365Provisioning.ps1` validates each CSV row, requires a two-letter ISO-style `UsageLocation`, checks for an exact existing UPN, creates a user, and evaluates the configured department-to-SKU mapping.
 
-Identity-lifecycle work is repetitive but security-sensitive. This lab demonstrates how a technician can turn a documented workflow into guarded automation while preserving review points, least-privilege guidance, dry-run behavior, and an auditable record.
+- A successful empty exact-filter query is treated as confirmed absence.
+- Permission, connectivity, Graph, or ambiguous lookup failures stop creation.
+- An existing user is a conflict. No reconciliation mode is implemented, so repeat runs are not described as automatically safe.
+- Two-letter validation is only a format check; tenant and license policy still control whether the value is accepted.
+- Temporary passwords use `RandomNumberGenerator`, require a change at next sign-in, and are displayed only after creation for approved secure delivery. They are not logged.
 
-The project intentionally avoids unsupported time-savings or production-success metrics. Its evidence is the source code, simulated input, `-WhatIf` logs, and automated tests checked into this repository.
-
----
-
-## Architecture
-
-```
-M365-IAM-Engine/
-├── Invoke-M365Provisioning.ps1   # Bulk user creation engine
-├── Invoke-M365Offboarding.ps1    # Single-user termination engine
-└── onboarding_queue.csv          # Input queue for provisioning
-```
-
-**Authentication flow:**
-
-Both scripts authenticate to Microsoft Graph using an Entra ID App Registration with Application-level permissions. Two credential methods are supported:
-
-- **Certificate (recommended for production):** No secret stored on disk. Uses a certificate thumbprint resolved from the local certificate store.
-- **Client Secret:** Accepted as a `SecureString` parameter at runtime. The plaintext value is never assigned to a variable and is not logged.
-
-**Graph API calls made:**
-
-| Script | Graph Operation |
-|---|---|
-| Provisioning | `POST /users`, `PUT /users/{id}/manager/$ref`, `POST /users/{id}/assignLicense` |
-| Offboarding | `PATCH /users/{id}` (disable), `POST /users/{id}/invalidateAllRefreshTokens`, `POST /users/{id}/assignLicense` (remove) |
-
----
-
-## Prerequisites
-
-**PowerShell module:**
-
-```powershell
-Install-Module Microsoft.Graph -Scope CurrentUser -Force
-```
-
-**Entra ID App Registration — required Application permissions (admin-consented):**
-
-| Permission | Used By |
-|---|---|
-| `User.ReadWrite.All` | Create, update, disable users |
-| `Directory.ReadWrite.All` | Assign manager, read directory |
-| `Organization.Read.All` | Read subscribed SKUs for license mapping |
-
----
-
-## Configuration
-
-No configuration file is required. All parameters are passed at runtime via named parameters. See `-WhatIf` mode for safe testing prior to production execution.
-
----
-
-## How to Use
-
-### 1. Provisioning
-
-**Reads** `onboarding_queue.csv`, creates each user in Entra ID, assigns a cryptographically generated temporary password with `ForceChangePasswordNextSignIn = $true`, and assigns an Office 365 license based on the user's department.
-
-**Certificate authentication (recommended):**
+CSV columns: `FirstName`, `LastName`, `Department`, `Title`, `UsageLocation`, and optional `Manager`.
 
 ```powershell
 .\Invoke-M365Provisioning.ps1 `
-    -TenantId             "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -ClientId             "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-    -CertificateThumbprint "AABBCCDDEEFF00112233445566778899AABBCCDD" `
-    -UPNDomain            "contoso.com" `
-    -CsvPath              ".\onboarding_queue.csv"
+  -TenantId 'tenant-guid' -ClientId 'app-guid' `
+  -CertificateThumbprint 'certificate-thumbprint' `
+  -UPNDomain 'example.com' -CsvPath .\onboarding_queue.csv -WhatIf
 ```
 
-**Client secret authentication:**
+## Offboarding behavior
 
-```powershell
-.\Invoke-M365Provisioning.ps1 `
-    -TenantId      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -ClientId      "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-    -ClientSecret  (Read-Host -AsSecureString "Enter Client Secret") `
-    -UPNDomain     "contoso.com"
-```
+`Invoke-M365Offboarding.ps1` is an ordered best-effort workflow with explicit partial-failure reporting. Its default is non-destructive: it may connect and resolve the user, but write actions remain `Planned`.
 
-**Simulation mode (no changes written to tenant):**
-
-```powershell
-.\Invoke-M365Provisioning.ps1 -TenantId "..." -ClientId "..." -CertificateThumbprint "..." -UPNDomain "contoso.com" -WhatIf
-```
-
----
-
-### 2. Offboarding
-
-**Takes a single `UserPrincipalName`** and executes the following sequence atomically:
-
-1. Disables the account (`AccountEnabled = $false`) — effective immediately
-2. Revokes all active Azure AD refresh tokens — terminates all active SSO sessions
-3. Removes all assigned Office 365 licenses in a single API call
+Separate approval switches control sign-in disablement and session revocation. License removal requires both `-ApproveLicenseRemoval` and `-LicensePrerequisitesConfirmed`.
 
 ```powershell
 .\Invoke-M365Offboarding.ps1 `
-    -UserPrincipalName    "jane.smith@contoso.com" `
-    -TenantId             "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -ClientId             "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-    -CertificateThumbprint "AABBCCDDEEFF00112233445566778899AABBCCDD"
+  -UserPrincipalName 'user@example.com' `
+  -TenantId 'tenant-guid' -ClientId 'app-guid' `
+  -CertificateThumbprint 'certificate-thumbprint' -WhatIf `
+  -ApproveDisableSignIn -ApproveSessionRevocation `
+  -ApproveLicenseRemoval -LicensePrerequisitesConfirmed
 ```
 
-**Simulation mode:**
+Mailbox/data retention, ownership transfer, group cleanup, OneDrive/legal hold, and account deletion remain policy-dependent planned actions. They are not automatic defaults. Session revocation is a request whose effect must be verified; the script does not claim that all access tokens instantly terminate.
+
+## Authentication
+
+The top-level parameter set selects `ClientSecret` or `Certificate`, and that mode is passed explicitly into the nested connection helper. The helper does not infer the caller's parameter set from its own `$PSCmdlet.ParameterSetName`.
+
+Application permissions and admin consent must be reviewed against the exact actions and least-privilege requirements of an authorized test tenant. Certificate authentication reduces client-secret handling but does not make the workflow production-ready by itself.
+
+## Logs
+
+Logs are editable local workflow records, not tamper-evident audit evidence. In `WhatIf`, they contain no `SUCCESS`, completed offboarding claim, session-revoked claim, or license-stripped claim.
+
+## Verification
 
 ```powershell
-.\Invoke-M365Offboarding.ps1 -UserPrincipalName "jane.smith@contoso.com" -TenantId "..." -ClientId "..." -CertificateThumbprint "..." -WhatIf
+Invoke-ScriptAnalyzer -Path . -Recurse
+Invoke-Pester .\tests
 ```
 
-Both scripts are **idempotent** — re-execution against an already-processed user is safe and produces no duplicate actions.
+The tests cover explicit auth mode, planned versus completed states, `WhatIf` no-write behavior, invalid usage location, unknown lookup, existing-user conflict, partial license failure, approval absent/present, and failed final status. Graph cmdlets are mocked; no tenant connection is made by the test suite.
 
----
-
-## CSV Schema
-
-`onboarding_queue.csv` — required columns:
-
-| Column | Required | Description |
-|---|---|---|
-| `FirstName` | Yes | User's given name |
-| `LastName` | Yes | User's surname |
-| `Department` | Yes | Determines license tier (see mapping below) |
-| `Title` | Yes | Job title |
-| `UsageLocation` | Yes | ISO 3166-1 alpha-2 country code (e.g., `US`) |
-| `Manager` | No | Full UPN of the user's manager |
-
-Rows with missing required fields are skipped and logged as `WARNING` entries. The remaining rows continue to process.
-
----
-
-## License SKU Mapping
-
-License assignment is determined at runtime by reading the tenant's active subscriptions via `Get-MgSubscribedSku`. The department-to-SKU mapping is:
-
-| Department | SKU Part Number | License |
-|---|---|---|
-| Engineering, IT Support | `ENTERPRISEPREMIUM` | Microsoft 365 E5 |
-| Finance, Human Resources | `ENTERPRISEPACK` | Office 365 E3 |
-| Marketing, (default) | `O365_BUSINESS_PREMIUM` | Microsoft 365 Business Premium |
-
-If a SKU is not available in the tenant's subscriptions, the user is created without a license and the event is logged as a `WARNING`.
-
----
-
-## Audit Logging
-
-Both scripts write structured, timestamped log entries to `.\Logs\` on each execution. Format:
-
-```
-[2026-08-08 19:51:03] [SUCCESS] | UPN=jane.smith@contoso.com | Action=CreateUser | User created. ObjectId=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-[2026-08-08 19:51:04] [SUCCESS] | UPN=jane.smith@contoso.com | Action=AssignLicense | License assigned: SkuId=06ebc4ee-1bb5-47dd-8120-11324bc54e06 (Dept='Finance')
-```
-
-**Provisioning** outputs generated temporary passwords only to the console for the executing technician. These are generated securely in-memory, never written to disk or audit logs, and must be transmitted via an approved secure channel.
-
-Log levels: `INFO`, `SUCCESS`, `WARNING`, `ERROR`
-
----
-
-## Security Notes
-
-- Temporary passwords are generated using `System.Security.Cryptography.RandomNumberGenerator`. `Get-Random` is not used.
-- Temporary passwords are kept in-memory and never written to disk or logs. They must be distributed via an approved secure channel.
-- Client secrets are accepted only as `[SecureString]` and converted to plaintext in-memory only at the point of the API call. They are not stored in variables or written to logs.
-- Certificate-based authentication is the recommended auth method for production deployments — it removes the need to manage or rotate a client secret.
-- The offboarding script calls `Invoke-MgInvalidateUserRefreshToken` (with a fallback to `Revoke-MgUserSignInSession`), which invalidates all issued refresh tokens. Active access tokens remain valid for their remaining TTL (typically up to 1 hour). For immediate hard termination, configure Continuous Access Evaluation (CAE) in Entra ID.
-
----
-
-## License
-
-MIT
+MIT licensed. See `LICENSE`.
