@@ -1,613 +1,256 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 
 <#
 .SYNOPSIS
-    Zero-Touch M365 User Provisioning Engine — Reads from a CSV queue,
-    creates Entra ID (Azure AD) users, assigns licenses, and emits an audit log.
+    Runs a CSV-driven Microsoft Entra provisioning workflow with explicit results.
 
 .DESCRIPTION
-    Invoke-M365Provisioning.ps1 is a portfolio automation script that models
-    Microsoft 365 / Entra ID provisioning. It performs the following actions
-    for each row in the onboarding_queue.csv:
-
-        1. Connects to Microsoft Graph via certificate-based or client-secret auth.
-        2. Validates the row schema and skips malformed entries with a log warning.
-        3. Generates a cryptographically random, policy-compliant temporary password.
-        4. Creates the Entra ID user with ForceChangePasswordNextSignIn = $true.
-        5. Conditionally assigns an Office 365 license based on the Department field.
-        6. Writes a timestamped audit entry for every action (success or failure).
-
-    License SKU mapping (Department → SkuPartNumber):
-        Engineering / IT Support  → ENTERPRISEPREMIUM  (Microsoft 365 E5)
-        Finance / Human Resources → ENTERPRISEPACK      (Office 365 E3)
-        Marketing / Default       → O365_BUSINESS_PREMIUM (Microsoft 365 Business Premium)
-
-.PARAMETER TenantId
-    The Azure AD Tenant ID (GUID). Required.
-
-.PARAMETER ClientId
-    The App Registration Client ID (GUID) for Graph API authentication. Required.
-
-.PARAMETER ClientSecret
-    [SecureString] The client secret for the App Registration. Mutually exclusive
-    with -CertificateThumbprint. Prefer certificate auth in production.
-
-.PARAMETER CertificateThumbprint
-    Thumbprint of a certificate installed in the local machine or current user
-    certificate store. Preferred for production deployments.
-
-.PARAMETER CsvPath
-    Path to the onboarding queue CSV. Defaults to .\onboarding_queue.csv.
-
-.PARAMETER UPNDomain
-    The verified domain suffix to append to generated UPNs (e.g., "contoso.com").
-    Required.
-
-.PARAMETER LogPath
-    Path to the audit log file. Defaults to .\Logs\M365Provisioning_<timestamp>.log.
-
-.PARAMETER WhatIf
-    Runs the full script in simulation mode — no users are created, no licenses
-    are assigned, and no Graph API write calls are made.
-
-.EXAMPLE
-    .\Invoke-M365Provisioning.ps1 `
-        -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientId  "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-        -CertificateThumbprint "AABBCCDDEEFF..." `
-        -UPNDomain "contoso.com"
-
-.EXAMPLE
-    .\Invoke-M365Provisioning.ps1 `
-        -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientId  "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-        -ClientSecret (Read-Host -AsSecureString "Enter Client Secret") `
-        -UPNDomain "contoso.com" `
-        -WhatIf
+    Each row is validated and returns per-action states: Planned,
+    SkippedWhatIf, Completed, Failed, or Unknown. Existing users are conflicts;
+    this script does not claim reconciliation or blanket repeat-run safety.
+    There is no rollback. A created user followed by a license failure is
+    reported as partial failure.
 
 .NOTES
-    Author      : Zero-Touch IAM Engine
-    Version     : 1.0.0
-    Requires    : Microsoft.Graph (Install-Module Microsoft.Graph -Scope CurrentUser)
-    Permissions : User.ReadWrite.All, Directory.ReadWrite.All,
-                  Organization.Read.All (Application permissions in Entra ID)
-    CSV Schema  : FirstName, LastName, Department, Title, UsageLocation, Manager
+    Offline WhatIf and mock tests do not validate live Microsoft Graph behavior.
 #>
 
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ClientSecret')]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$TenantId,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$ClientId,
-
-    [Parameter(Mandatory = $true, ParameterSetName = 'ClientSecret')]
-    [ValidateNotNull()]
-    [SecureString]$ClientSecret,
-
-    [Parameter(Mandatory = $true, ParameterSetName = 'Certificate')]
-    [ValidateNotNullOrEmpty()]
-    [string]$CertificateThumbprint,
-
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$UPNDomain,
-
-    [Parameter(Mandatory = $false)]
-    [ValidateScript({ Test-Path $_ -PathType Leaf })]
-    [string]$CsvPath = ".\onboarding_queue.csv",
-
-    [Parameter(Mandatory = $false)]
-    [string]$LogPath = ".\Logs\M365Provisioning_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$TenantId,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ClientId,
+    [Parameter(Mandatory, ParameterSetName = 'ClientSecret')][ValidateNotNull()][SecureString]$ClientSecret,
+    [Parameter(Mandatory, ParameterSetName = 'Certificate')][ValidateNotNullOrEmpty()][string]$CertificateThumbprint,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$UPNDomain,
+    [ValidateScript({ Test-Path $_ -PathType Leaf })][string]$CsvPath = '.\onboarding_queue.csv',
+    [string]$LogPath = ".\Logs\M365Provisioning_$(Get-Date -Format 'yyyyMMdd_HHmmss').log",
+    [switch]$SuppressCredentialDisplay
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:AuthMethod = $PSCmdlet.ParameterSetName
-
-# ---------------------------------------------------------------------------
-# REGION: CONSTANTS
-# ---------------------------------------------------------------------------
-
-# Mapping of Department name → M365 License SKU Part Number
-# Update SkuId GUIDs to match your tenant (run: Get-MgSubscribedSku)
-$script:LicenseMap = @{
-    'Engineering'     = @{ SkuPartNumber = 'ENTERPRISEPREMIUM';       SkuId = $null }
-    'IT Support'      = @{ SkuPartNumber = 'ENTERPRISEPREMIUM';       SkuId = $null }
-    'Finance'         = @{ SkuPartNumber = 'ENTERPRISEPACK';          SkuId = $null }
-    'Human Resources' = @{ SkuPartNumber = 'ENTERPRISEPACK';          SkuId = $null }
-    'Marketing'       = @{ SkuPartNumber = 'O365_BUSINESS_PREMIUM';   SkuId = $null }
-    'Default'         = @{ SkuPartNumber = 'O365_BUSINESS_PREMIUM';   SkuId = $null }
+$authMethod = $PSCmdlet.ParameterSetName
+$results = [System.Collections.Generic.List[object]]::new()
+$requiredColumns = @('FirstName', 'LastName', 'Department', 'Title', 'UsageLocation')
+$licensePartNumbers = @{
+    'Engineering' = 'ENTERPRISEPREMIUM'; 'IT Support' = 'ENTERPRISEPREMIUM'
+    'Finance' = 'ENTERPRISEPACK'; 'Human Resources' = 'ENTERPRISEPACK'
+    'Marketing' = 'O365_BUSINESS_PREMIUM'; 'Default' = 'O365_BUSINESS_PREMIUM'
 }
 
-$script:RequiredCsvColumns = @('FirstName', 'LastName', 'Department', 'Title', 'UsageLocation')
-
-$script:GraphScopes = @(
-    'User.ReadWrite.All',
-    'Directory.ReadWrite.All',
-    'Organization.Read.All'
-)
-
-$script:RequiredGraphModules = @(
-    'Microsoft.Graph.Authentication',
-    'Microsoft.Graph.Users',
-    'Microsoft.Graph.Identity.DirectoryManagement'
-)
-
-# ---------------------------------------------------------------------------
-# REGION: LOGGING
-# ---------------------------------------------------------------------------
-
-function Write-AuditLog {
-    <#
-    .SYNOPSIS Writes a structured, timestamped entry to the audit log and console.
-    #>
-    [CmdletBinding()]
+function Write-WorkflowLog {
     param(
-        [Parameter(Mandatory)] [string]$Message,
-        [Parameter(Mandatory)] [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')] [string]$Level,
-        [Parameter()] [string]$UPN = '',
-        [Parameter()] [string]$Action = ''
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'WARNING', 'ERROR')][string]$Level = 'INFO',
+        [string]$Action = '', [string]$UPN = ''
     )
-
-    $timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $upnPart    = if ($UPN)    { " | UPN=$UPN" }    else { '' }
-    $actionPart = if ($Action) { " | Action=$Action" } else { '' }
-    $logLine    = "[$timestamp] [$Level]$upnPart$actionPart | $Message"
-
-    # Console output with colour
-    $colour = switch ($Level) {
-        'SUCCESS' { 'Green'  }
-        'WARNING' { 'Yellow' }
-        'ERROR'   { 'Red'    }
-        default   { 'Cyan'   }
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] | UPN=$UPN | Action=$Action | $Message"
+    Write-Host $line
+    $directory = Split-Path $LogPath -Parent
+    if ($directory -and -not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force -WhatIf:$false | Out-Null
     }
-    Write-Host $logLine -ForegroundColor $colour
-
-    # File output
-    try {
-        $logDir = Split-Path $script:LogPath -Parent
-        if ($logDir -and -not (Test-Path $logDir)) {
-            # WhatIf protects tenant operations, but the local audit evidence
-            # should still be written so the simulation can be reviewed.
-            New-Item -ItemType Directory -Path $logDir -Force -WhatIf:$false | Out-Null
-        }
-        Add-Content -Path $script:LogPath -Value $logLine -Encoding UTF8 -WhatIf:$false
-    }
-    catch {
-        Write-Warning "Audit log write failed: $_"
-    }
+    Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8 -WhatIf:$false
 }
 
-# ---------------------------------------------------------------------------
-# REGION: PASSWORD GENERATION
-# ---------------------------------------------------------------------------
+function Add-ActionResult {
+    param(
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][ValidateSet('Planned', 'SkippedWhatIf', 'Completed', 'Failed', 'Unknown')][string]$State,
+        [Parameter(Mandatory)][string]$Detail,
+        [string]$UPN = '', [bool]$Required = $false
+    )
+    $item = [pscustomobject]@{ Action = $Action; State = $State; Required = $Required; UPN = $UPN; Detail = $Detail }
+    $results.Add($item)
+    $level = if ($State -in @('Failed', 'Unknown')) { 'ERROR' } elseif ($State -in @('Planned', 'SkippedWhatIf')) { 'WARNING' } else { 'INFO' }
+    Write-WorkflowLog -Level $level -Action $Action -UPN $UPN -Message "State=$State; $Detail"
+    return $item
+}
 
 function New-ComplexPassword {
-    <#
-    .SYNOPSIS
-        Generates a cryptographically random, policy-compliant temporary password.
-        Meets Entra ID defaults: 8+ chars, upper, lower, digit, special.
-    #>
     [OutputType([string])]
-    param(
-        [int]$Length = 16
-    )
-
-    $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'      # no I/O to avoid visual confusion
-    $lower   = 'abcdefghjkmnpqrstuvwxyz'        # no i/l/o
-    $digits  = '23456789'                        # no 0/1
-    $special = '!@#$%^&*()-_=+'
-    $all     = $upper + $lower + $digits + $special
-
-    $rng   = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $bytes = [byte[]]::new($Length * 2)
-    $rng.GetBytes($bytes)
-
-    $chars = [System.Collections.Generic.List[char]]::new()
-
-    # Guarantee at least one of each required class
-    $chars.Add($upper[ $bytes[0] % $upper.Length ])
-    $chars.Add($lower[ $bytes[1] % $lower.Length ])
-    $chars.Add($digits[$bytes[2] % $digits.Length])
-    $chars.Add($special[$bytes[3] % $special.Length])
-
-    # Fill remaining length from the full pool
-    for ($i = 4; $i -lt $Length; $i++) {
-        $chars.Add($all[$bytes[$i] % $all.Length])
-    }
-
-    # Fisher-Yates shuffle using RNG
-    $shuffleBytes = [byte[]]::new($chars.Count)
-    $rng.GetBytes($shuffleBytes)
-    for ($i = $chars.Count - 1; $i -gt 0; $i--) {
-        $j = $shuffleBytes[$i] % ($i + 1)
-        $tmp       = $chars[$i]
-        $chars[$i] = $chars[$j]
-        $chars[$j] = $tmp
-    }
-
-    $rng.Dispose()
-    return -join $chars
-}
-
-function Test-MicrosoftGraphModules {
-    [CmdletBinding()]
-    param()
-
-    if ($WhatIfPreference) {
-        return
-    }
-
-    $missing = @(
-        foreach ($moduleName in $script:RequiredGraphModules) {
-            if (-not (Get-Module -ListAvailable -Name $moduleName)) {
-                $moduleName
-            }
+    param([ValidateRange(12, 128)][int]$Length = 16)
+    $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghjkmnpqrstuvwxyz', '23456789', '!@#$%^&*()-_=+')
+    $pool = $sets -join ''
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $chars = [Collections.Generic.List[char]]::new()
+        foreach ($set in $sets) {
+            $bytes = [byte[]]::new(4); $rng.GetBytes($bytes)
+            $chars.Add($set[[BitConverter]::ToUInt32($bytes, 0) % $set.Length])
         }
-    )
-
-    if ($missing.Count -gt 0) {
-        $install = 'Install-Module Microsoft.Graph -Scope CurrentUser'
-        throw "Missing Microsoft Graph module(s): $($missing -join ', '). Install with: $install"
+        while ($chars.Count -lt $Length) {
+            $bytes = [byte[]]::new(4); $rng.GetBytes($bytes)
+            $chars.Add($pool[[BitConverter]::ToUInt32($bytes, 0) % $pool.Length])
+        }
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $bytes = [byte[]]::new(4); $rng.GetBytes($bytes)
+            $j = [BitConverter]::ToUInt32($bytes, 0) % ($i + 1)
+            $temp = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $temp
+        }
+        return -join $chars
     }
+    finally { $rng.Dispose() }
 }
 
-function ConvertTo-MailSafeToken {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Value
-    )
-
-    $token = $Value.Trim().ToLowerInvariant()
-    $token = $token -replace '\s+', '.'
-    $token = $token -replace '[^a-z0-9._-]', ''
-    $token = $token.Trim('.-_')
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw "Cannot build UPN/mail nickname from blank or unsupported value '$Value'."
-    }
+function ConvertTo-MailToken {
+    param([Parameter(Mandatory)][string]$Value)
+    $token = ($Value.Trim().ToLowerInvariant() -replace '\s+', '.' -replace '[^a-z0-9._-]', '').Trim('.-_')
+    if ([string]::IsNullOrWhiteSpace($token)) { throw "Cannot build mail token from '$Value'." }
     return $token
 }
 
-function Escape-ODataString {
-    param([AllowNull()][string]$Value)
-    if ($null -eq $Value) { return '' }
-    return ($Value -replace "'", "''")
-}
-
-# ---------------------------------------------------------------------------
-# REGION: GRAPH HELPERS
-# ---------------------------------------------------------------------------
-
-function Connect-ToMicrosoftGraph {
-    <#
-    .SYNOPSIS Authenticates to Microsoft Graph using the supplied credential method.
-    #>
-    [CmdletBinding()]
-    param()
-
-    Write-AuditLog -Level 'INFO' -Action 'GraphConnect' -Message "Initiating Microsoft Graph connection (TenantId=$TenantId, ClientId=$ClientId, AuthMethod=$script:AuthMethod)"
-
+function Connect-WorkflowGraph {
+    param([Parameter(Mandatory)][ValidateSet('ClientSecret', 'Certificate')][string]$AuthMethod)
     if ($WhatIfPreference) {
-        Write-AuditLog -Level 'WARNING' -Action 'GraphConnect' -Message 'WhatIf mode - skipping actual Graph connection.'
-        return
-    }
-
-    Test-MicrosoftGraphModules
-
-    $connectParams = @{
-        TenantId = $TenantId
-        ClientId = $ClientId
-        NoWelcome = $true
-    }
-
-    if ($script:AuthMethod -eq 'Certificate') {
-        $connectParams['CertificateThumbprint'] = $CertificateThumbprint
-    }
-    else {
-        # Convert SecureString → plain text only within the call; never stored in a variable
-        $connectParams['ClientSecretCredential'] = [System.Net.NetworkCredential]::new(
-            '', $ClientSecret
-        ).Password | ForEach-Object {
-            [System.Management.Automation.PSCredential]::new($ClientId,
-                (ConvertTo-SecureString $_ -AsPlainText -Force))
-        }
-    }
-
-    try {
-        Connect-MgGraph @connectParams -ErrorAction Stop
-        Write-AuditLog -Level 'SUCCESS' -Action 'GraphConnect' -Message 'Connected to Microsoft Graph successfully.'
-    }
-    catch {
-        Write-AuditLog -Level 'ERROR' -Action 'GraphConnect' -Message "Graph connection failed: $_"
-        throw
-    }
-}
-
-function Resolve-LicenseSkuIds {
-    <#
-    .SYNOPSIS
-        Queries the tenant's subscribed SKUs and populates the SkuId field
-        in $script:LicenseMap. Called once after authentication.
-    #>
-    [CmdletBinding()]
-    param()
-
-    Write-AuditLog -Level 'INFO' -Action 'ResolveSKUs' -Message 'Fetching subscribed SKUs from tenant...'
-
-    if ($WhatIfPreference) {
-        Write-AuditLog -Level 'WARNING' -Action 'ResolveSKUs' -Message 'WhatIf mode - SKU resolution skipped.'
-        return
-    }
-
-    try {
-        $subscribedSkus = Get-MgSubscribedSku -All -ErrorAction Stop
-
-        foreach ($key in @($script:LicenseMap.Keys)) {
-            $skuPartNumber = $script:LicenseMap[$key].SkuPartNumber
-            $matched = $subscribedSkus | Where-Object { $_.SkuPartNumber -eq $skuPartNumber } | Select-Object -First 1
-
-            if ($matched) {
-                $script:LicenseMap[$key].SkuId = $matched.SkuId
-                Write-AuditLog -Level 'INFO' -Action 'ResolveSKUs' -Message "Mapped '$skuPartNumber' → SkuId=$($matched.SkuId) (Available: $($matched.PrepaidUnits.Enabled - $matched.ConsumedUnits))"
-            }
-            else {
-                Write-AuditLog -Level 'WARNING' -Action 'ResolveSKUs' -Message "SKU '$skuPartNumber' not found in tenant subscriptions. Users in '$key' will not receive a license."
-            }
-        }
-    }
-    catch {
-        Write-AuditLog -Level 'ERROR' -Action 'ResolveSKUs' -Message "Failed to resolve SKUs: $_"
-        throw
-    }
-}
-
-function Get-LicenseAssignment {
-    <#
-    .SYNOPSIS Returns a license assignment hashtable for the given department, or $null if no SKU resolved.
-    #>
-    param([string]$Department)
-
-    $entry = if ($script:LicenseMap.ContainsKey($Department)) {
-        $script:LicenseMap[$Department]
-    }
-    else {
-        $script:LicenseMap['Default']
-    }
-
-    if (-not $entry.SkuId) { return $null }
-
-    return @{
-        SkuId           = $entry.SkuId
-        DisabledPlans   = @()   # Assign all plans; narrow here if needed
-    }
-}
-
-function New-EntraUser {
-    <#
-    .SYNOPSIS Creates a single Entra ID user from a CSV row object.
-    .OUTPUTS Returns $true on success, $false on failure.
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)] [PSCustomObject]$Row,
-        [Parameter(Mandatory)] [string]$TempPassword
-    )
-
-    $firstToken  = ConvertTo-MailSafeToken -Value $Row.FirstName
-    $lastToken   = ConvertTo-MailSafeToken -Value $Row.LastName
-    $upn         = "$firstToken.$lastToken@$UPNDomain"
-    $displayName = "$($Row.FirstName) $($Row.LastName)"
-    $mailNick    = "$firstToken$lastToken" -replace '[^a-z0-9]', ''
-
-    Write-AuditLog -Level 'INFO' -Action 'CreateUser' -UPN $upn -Message "Preparing to create user: DisplayName='$displayName', Department='$($Row.Department)', Title='$($Row.Title)'"
-
-    # --- WhatIf guard ---
-    if (-not $PSCmdlet.ShouldProcess($upn, 'Create Entra ID User')) {
-        Write-AuditLog -Level 'WARNING' -Action 'CreateUser' -UPN $upn -Message 'WhatIf: User creation skipped.'
+        Add-ActionResult -Action 'GraphConnect' -State 'SkippedWhatIf' -Detail "No connection attempted; AuthMethod=$AuthMethod" | Out-Null
         return $true
     }
-
-    # --- Check for pre-existing user ---
     try {
-        $upnFilter = Escape-ODataString -Value $upn
-        $existingUser = Get-MgUser -Filter "userPrincipalName eq '$upnFilter'" -ErrorAction Stop
-        if ($existingUser) {
-            Write-AuditLog -Level 'WARNING' -Action 'CreateUser' -UPN $upn -Message "User already exists (ObjectId=$($existingUser.Id)). Skipping creation."
-            return $false
-        }
+        $connect = @{ TenantId = $TenantId; ClientId = $ClientId; NoWelcome = $true }
+        if ($AuthMethod -eq 'Certificate') { $connect.CertificateThumbprint = $CertificateThumbprint }
+        else { $connect.ClientSecretCredential = [pscredential]::new($ClientId, $ClientSecret) }
+        Connect-MgGraph @connect -ErrorAction Stop
+        Add-ActionResult -Action 'GraphConnect' -State 'Completed' -Detail "Connected using AuthMethod=$AuthMethod" | Out-Null
+        return $true
     }
     catch {
-        # A 404 / empty result is expected; any other error should surface
-        if ($_.Exception.Message -notmatch '404|not found|does not exist') {
-            Write-AuditLog -Level 'ERROR' -Action 'CreateUser' -UPN $upn -Message "Pre-existence check failed: $_"
-            return $false
-        }
-    }
-
-    # --- Build user body ---
-    $passwordProfile = @{
-        Password                      = $TempPassword
-        ForceChangePasswordNextSignIn = $true
-    }
-
-    $userParams = @{
-        DisplayName       = $displayName
-        GivenName         = $Row.FirstName
-        Surname           = $Row.LastName
-        UserPrincipalName = $upn
-        MailNickname      = $mailNick
-        Department        = $Row.Department
-        JobTitle          = $Row.Title
-        UsageLocation     = if ($Row.UsageLocation) { $Row.UsageLocation } else { 'US' }
-        AccountEnabled    = $true
-        PasswordProfile   = $passwordProfile
-    }
-
-    # Optionally set manager (best-effort; non-fatal if manager UPN not found)
-    $managerRef = $null
-    $managerUpn = if ($Row.PSObject.Properties.Name -contains 'Manager') { ([string]$Row.Manager).Trim() } else { '' }
-    if (-not [string]::IsNullOrWhiteSpace($managerUpn)) {
-        try {
-            $managerFilter = Escape-ODataString -Value $managerUpn
-            $mgr = Get-MgUser -Filter "userPrincipalName eq '$managerFilter'" -ErrorAction Stop
-            if ($mgr) { $managerRef = $mgr.Id }
-        }
-        catch {
-            Write-AuditLog -Level 'WARNING' -Action 'SetManager' -UPN $upn -Message "Manager '$managerUpn' not found - skipping manager assignment."
-        }
-    }
-
-    # --- Create user ---
-    try {
-        $newUser = New-MgUser -BodyParameter $userParams -ErrorAction Stop
-        Write-AuditLog -Level 'SUCCESS' -Action 'CreateUser' -UPN $upn -Message "User created. ObjectId=$($newUser.Id)"
-    }
-    catch {
-        Write-AuditLog -Level 'ERROR' -Action 'CreateUser' -UPN $upn -Message "User creation failed: $_"
+        Add-ActionResult -Action 'GraphConnect' -State 'Unknown' -Required $true -Detail "Connection failed: $($_.Exception.Message)" | Out-Null
         return $false
     }
-
-    # --- Set manager (best-effort) ---
-    if ($managerRef) {
-        try {
-            $managerBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/users/$managerRef" }
-            Set-MgUserManagerByRef -UserId $newUser.Id -BodyParameter $managerBody -ErrorAction Stop
-            Write-AuditLog -Level 'INFO' -Action 'SetManager' -UPN $upn -Message "Manager set to ObjectId=$managerRef"
-        }
-        catch {
-            Write-AuditLog -Level 'WARNING' -Action 'SetManager' -UPN $upn -Message "Manager assignment failed (non-fatal): $_"
-        }
-    }
-
-    # --- Assign license ---
-    $licenseAssignment = Get-LicenseAssignment -Department $Row.Department
-
-    if ($licenseAssignment) {
-        try {
-            Set-MgUserLicense -UserId $newUser.Id `
-                -AddLicenses @($licenseAssignment) `
-                -RemoveLicenses @() `
-                -ErrorAction Stop
-
-            Write-AuditLog -Level 'SUCCESS' -Action 'AssignLicense' -UPN $upn `
-                -Message "License assigned: SkuId=$($licenseAssignment.SkuId) (Dept='$($Row.Department)')"
-        }
-        catch {
-            Write-AuditLog -Level 'ERROR' -Action 'AssignLicense' -UPN $upn -Message "License assignment failed: $_"
-            # User was created; this is a non-fatal error — still return true
-        }
-    }
-    else {
-        Write-AuditLog -Level 'WARNING' -Action 'AssignLicense' -UPN $upn -Message "No resolvable SKU for department '$($Row.Department)'. License not assigned."
-    }
-
-    Write-AuditLog -Level 'SUCCESS' -Action 'Provisioning' -UPN $upn -Message "Provisioning complete."
-
-    # -----------------------------------------------------------------------
-    # SECURE CREDENTIAL DELIVERY
-    # The temporary password is generated in memory and never written to disk.
-    # It must be transmitted to the user via an approved secure channel (e.g., 
-    # self-destructing message, password manager, or direct verbal exchange).
-    # -----------------------------------------------------------------------
-    Write-Host ""
-    Write-Host "  ========================================================" -ForegroundColor DarkCyan
-    Write-Host "  NEW USER CREDENTIAL GENERATED" -ForegroundColor Cyan
-    Write-Host "  UPN      : $upn" -ForegroundColor White
-    Write-Host "  Password : $TempPassword" -ForegroundColor Yellow
-    Write-Host "  ACTION   : Transmit these details via an approved secure channel." -ForegroundColor Red
-    Write-Host "  ========================================================" -ForegroundColor DarkCyan
-    Write-Host ""
-
-    Write-AuditLog -Level 'INFO' -Action 'Security' -UPN $upn -Message "Temporary password generated in memory and displayed to technician. Transmit via secure channel. Not written to disk."
-
-    return $true
 }
 
-function Test-CsvRow {
-    <#
-    .SYNOPSIS Validates a CSV row has all required columns populated. Returns $true if valid.
-    #>
-    param([PSCustomObject]$Row, [int]$RowIndex)
-
-    foreach ($col in $script:RequiredCsvColumns) {
-        if (-not ($Row.PSObject.Properties.Name -contains $col) -or
-            [string]::IsNullOrWhiteSpace($Row.$col)) {
-            Write-AuditLog -Level 'WARNING' -Action 'Validation' -Message "Row $RowIndex skipped — missing or empty required field: '$col'."
-            return $false
-        }
-    }
-    return $true
-}
-
-# ---------------------------------------------------------------------------
-# REGION: MAIN EXECUTION
-# ---------------------------------------------------------------------------
-
-function Invoke-Provisioning {
-    [CmdletBinding(SupportsShouldProcess)]
-    param()
-
-    Write-AuditLog -Level 'INFO' -Action 'Startup' -Message "=== Invoke-M365Provisioning.ps1 started. Mode=$(if($WhatIfPreference){'WHATIF'}else{'LIVE'}) ==="
-    Write-AuditLog -Level 'INFO' -Action 'Startup' -Message "Log file: $($script:LogPath)"
-
-    # --- Load CSV ---
-    Write-AuditLog -Level 'INFO' -Action 'LoadCSV' -Message "Loading onboarding queue from: $CsvPath"
+function Get-LicenseSkuMap {
+    if ($WhatIfPreference) { return @{} }
+    $map = @{}
     try {
-        $queue = Import-Csv -Path $CsvPath -ErrorAction Stop
+        foreach ($sku in @(Get-MgSubscribedSku -All -ErrorAction Stop)) { $map[$sku.SkuPartNumber] = $sku.SkuId }
+        Add-ActionResult -Action 'ResolveLicenses' -State 'Completed' -Detail "Resolved $($map.Count) tenant SKU(s)." | Out-Null
     }
     catch {
-        Write-AuditLog -Level 'ERROR' -Action 'LoadCSV' -Message "Failed to import CSV '$CsvPath': $_"
-        throw
+        Add-ActionResult -Action 'ResolveLicenses' -State 'Unknown' -Required $true -Detail "SKU lookup failed: $($_.Exception.Message)" | Out-Null
     }
+    return $map
+}
 
-    if ($queue.Count -eq 0) {
-        Write-AuditLog -Level 'WARNING' -Action 'LoadCSV' -Message 'CSV is empty. Nothing to provision.'
+function Invoke-ProvisioningRow {
+    param([Parameter(Mandatory)][pscustomobject]$Row, [Parameter(Mandatory)][hashtable]$SkuMap, [int]$RowNumber)
+    foreach ($column in $requiredColumns) {
+        if (-not ($Row.PSObject.Properties.Name -contains $column) -or [string]::IsNullOrWhiteSpace([string]$Row.$column)) {
+            Add-ActionResult -Action 'ValidateRow' -State 'Failed' -Required $true -Detail "Row $RowNumber is missing '$column'." | Out-Null
+            return
+        }
+    }
+    $usage = ([string]$Row.UsageLocation).Trim().ToUpperInvariant()
+    if ($usage -notmatch '^[A-Z]{2}$') {
+        Add-ActionResult -Action 'ValidateRow' -State 'Failed' -Required $true -Detail "Row $RowNumber UsageLocation must be a two-letter ISO-style value." | Out-Null
+        return
+    }
+    $upn = "$(ConvertTo-MailToken $Row.FirstName).$(ConvertTo-MailToken $Row.LastName)@$UPNDomain"
+    $validationState = if ($WhatIfPreference) { 'SkippedWhatIf' } else { 'Completed' }
+    Add-ActionResult -Action 'ValidateRow' -State $validationState -UPN $upn -Detail "Row $RowNumber passed local validation; tenant policy still controls acceptance." | Out-Null
+    if (-not $PSCmdlet.ShouldProcess($upn, 'Create Entra user and evaluate configured license assignment')) {
+        Add-ActionResult -Action 'CreateUser' -State 'SkippedWhatIf' -Required $true -UPN $upn -Detail 'No lookup or write performed.' | Out-Null
+        Add-ActionResult -Action 'AssignLicense' -State 'Planned' -UPN $upn -Detail 'License decision requires live SKU and tenant policy data.' | Out-Null
         return
     }
 
-    Write-AuditLog -Level 'INFO' -Action 'LoadCSV' -Message "Loaded $($queue.Count) row(s) from CSV."
+    try {
+        $escaped = $upn -replace "'", "''"
+        $existing = @(Get-MgUser -Filter "userPrincipalName eq '$escaped'" -ErrorAction Stop)
+    }
+    catch {
+        Add-ActionResult -Action 'LookupUser' -State 'Unknown' -Required $true -UPN $upn -Detail "Lookup failed; creation stopped: $($_.Exception.Message)" | Out-Null
+        return
+    }
+    if ($existing.Count -gt 1) {
+        Add-ActionResult -Action 'LookupUser' -State 'Unknown' -Required $true -UPN $upn -Detail 'Lookup returned multiple users; creation stopped.' | Out-Null
+        return
+    }
+    if ($existing.Count -eq 1) {
+        Add-ActionResult -Action 'LookupUser' -State 'Failed' -Required $true -UPN $upn -Detail 'Existing user conflict; no reconciliation mode is implemented.' | Out-Null
+        return
+    }
+    Add-ActionResult -Action 'LookupUser' -State 'Completed' -UPN $upn -Detail 'Confirmed missing by a successful exact-filter query.' | Out-Null
 
-    # --- Authenticate ---
-    Connect-ToMicrosoftGraph
-
-    # --- Resolve license SKU IDs from tenant ---
-    Resolve-LicenseSkuIds
-
-    # --- Process each row ---
-    $stats = @{ Total = $queue.Count; Success = 0; Skipped = 0; Failed = 0 }
-
-    for ($i = 0; $i -lt $queue.Count; $i++) {
-        $row      = $queue[$i]
-        $rowIndex = $i + 1
-
-        Write-AuditLog -Level 'INFO' -Action 'ProcessRow' -Message "--- Processing row $rowIndex of $($queue.Count) ---"
-
-        if (-not (Test-CsvRow -Row $row -RowIndex $rowIndex)) {
-            $stats.Skipped++
-            continue
+    $managerId = $null
+    $manager = if ($Row.PSObject.Properties.Name -contains 'Manager') { ([string]$Row.Manager).Trim() } else { '' }
+    if ($manager) {
+        try {
+            $escapedManager = $manager -replace "'", "''"
+            $managerMatches = @(Get-MgUser -Filter "userPrincipalName eq '$escapedManager'" -ErrorAction Stop)
+            if ($managerMatches.Count -eq 1) { $managerId = $managerMatches[0].Id }
+            elseif ($managerMatches.Count -gt 1) { throw 'Manager lookup was ambiguous.' }
+            else { Add-ActionResult -Action 'ResolveManager' -State 'Planned' -UPN $upn -Detail 'Manager was confirmed missing; manager assignment omitted.' | Out-Null }
         }
-
-        $tempPw = New-ComplexPassword -Length 16
-        $result = New-EntraUser -Row $row -TempPassword $tempPw
-
-        if ($result) { $stats.Success++ }
-        else         { $stats.Failed++  }
+        catch {
+            Add-ActionResult -Action 'ResolveManager' -State 'Unknown' -Required $true -UPN $upn -Detail "Manager lookup failed; user creation stopped: $($_.Exception.Message)" | Out-Null
+            return
+        }
     }
 
-    # --- Summary ---
-    Write-AuditLog -Level 'INFO' -Action 'Summary' -Message "=== Provisioning run complete ==="
-    Write-AuditLog -Level 'INFO' -Action 'Summary' -Message "Total: $($stats.Total) | Success: $($stats.Success) | Skipped: $($stats.Skipped) | Failed: $($stats.Failed)"
+    $password = New-ComplexPassword
+    $body = @{
+        DisplayName = "$($Row.FirstName) $($Row.LastName)"; GivenName = $Row.FirstName; Surname = $Row.LastName
+        UserPrincipalName = $upn; MailNickname = (ConvertTo-MailToken "$($Row.FirstName)$($Row.LastName)")
+        Department = $Row.Department; JobTitle = $Row.Title; UsageLocation = $usage; AccountEnabled = $true
+        PasswordProfile = @{ Password = $password; ForceChangePasswordNextSignIn = $true }
+    }
+    try {
+        $newUser = New-MgUser -BodyParameter $body -ErrorAction Stop
+        Add-ActionResult -Action 'CreateUser' -State 'Completed' -Required $true -UPN $upn -Detail "Created ObjectId=$($newUser.Id); no rollback is available." | Out-Null
+    }
+    catch {
+        Add-ActionResult -Action 'CreateUser' -State 'Failed' -Required $true -UPN $upn -Detail "Creation failed: $($_.Exception.Message)" | Out-Null
+        return
+    }
+    if ($managerId) {
+        try {
+            Set-MgUserManagerByRef -UserId $newUser.Id -BodyParameter @{ '@odata.id' = "https://graph.microsoft.com/v1.0/users/$managerId" } -ErrorAction Stop
+            Add-ActionResult -Action 'SetManager' -State 'Completed' -UPN $upn -Detail "Manager set to ObjectId=$managerId" | Out-Null
+        }
+        catch { Add-ActionResult -Action 'SetManager' -State 'Failed' -UPN $upn -Detail "Manager assignment failed after user creation: $($_.Exception.Message)" | Out-Null }
+    }
 
-    if (-not $WhatIfPreference) {
-        try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
-        Write-AuditLog -Level 'INFO' -Action 'Cleanup' -Message 'Disconnected from Microsoft Graph.'
+    $partNumber = if ($licensePartNumbers.ContainsKey([string]$Row.Department)) { $licensePartNumbers[[string]$Row.Department] } else { $licensePartNumbers.Default }
+    $skuId = $SkuMap[$partNumber]
+    if (-not $skuId) {
+        Add-ActionResult -Action 'AssignLicense' -State 'Planned' -UPN $upn -Detail "No resolved SkuId for $partNumber; user exists without this license." | Out-Null
+    }
+    else {
+        try {
+            Set-MgUserLicense -UserId $newUser.Id -AddLicenses @(@{ SkuId = $skuId; DisabledPlans = @() }) -RemoveLicenses @() -ErrorAction Stop | Out-Null
+            Add-ActionResult -Action 'AssignLicense' -State 'Completed' -Required $true -UPN $upn -Detail "Assigned configured SkuId=$skuId." | Out-Null
+        }
+        catch { Add-ActionResult -Action 'AssignLicense' -State 'Failed' -Required $true -UPN $upn -Detail "License assignment failed after user creation: $($_.Exception.Message)" | Out-Null }
+    }
+    if (-not $SuppressCredentialDisplay) {
+        Write-Host "Temporary credential for approved secure delivery: $upn / $password" -ForegroundColor Yellow
     }
 }
 
-# Entry point
-Invoke-Provisioning
+Write-WorkflowLog -Action 'Startup' -Message "Provisioning workflow started; AuthMethod=$authMethod; Mode=$(if ($WhatIfPreference) { 'WhatIf' } else { 'Live' })"
+try {
+    $queue = @(Import-Csv -LiteralPath $CsvPath -ErrorAction Stop)
+    if (-not (Connect-WorkflowGraph -AuthMethod $authMethod)) { $queue = @() }
+    $skuMap = Get-LicenseSkuMap
+    for ($index = 0; $index -lt $queue.Count; $index++) { Invoke-ProvisioningRow -Row $queue[$index] -SkuMap $skuMap -RowNumber ($index + 2) }
+}
+catch {
+    Add-ActionResult -Action 'Workflow' -State 'Failed' -Required $true -Detail $_.Exception.Message | Out-Null
+}
+finally {
+    if (-not $WhatIfPreference) { try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {} }
+}
+
+$failedRequired = @($results | Where-Object { $_.Required -and $_.State -in @('Failed', 'Unknown') })
+$completed = @($results | Where-Object State -eq 'Completed').Count
+$planned = @($results | Where-Object State -in @('Planned', 'SkippedWhatIf')).Count
+$final = [pscustomobject]@{
+    Status = if ($failedRequired.Count -gt 0) { 'Failed' } elseif ($completed -gt 0) { 'PartialOrCompleted' } else { 'PlannedOnly' }
+    Succeeded = ($failedRequired.Count -eq 0); CompletedCount = $completed; PlannedCount = $planned
+    Results = @($results); RollbackAvailable = $false
+}
+Write-WorkflowLog -Action 'Summary' -Level $(if ($final.Succeeded) { 'INFO' } else { 'ERROR' }) -Message "FinalStatus=$($final.Status); Completed=$completed; PlannedOrSkipped=$planned; FailedRequired=$($failedRequired.Count); RollbackAvailable=false"
+$final
+if (-not $final.Succeeded) { throw 'Provisioning workflow ended with a failed or unknown required action.' }
